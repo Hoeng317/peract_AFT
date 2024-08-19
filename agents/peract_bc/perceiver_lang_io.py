@@ -1,6 +1,3 @@
-# Perceiver IO implementation adpated for manipulation
-# Source: https://github.com/lucidrains/perceiver-pytorch
-# License: https://github.com/lucidrains/perceiver-pytorch/blob/main/LICENSE
 
 from math import pi, log
 from functools import wraps
@@ -14,123 +11,95 @@ from einops.layers.torch import Reduce
 
 from helpers.network_utils import DenseBlock, SpatialSoftmax3D, Conv3DBlock, Conv3DUpsampleBlock
 
-# helpers
+# AFTSimple 클래스 정의
+class AFTSimple(nn.Module):
+    def __init__(self, max_seqlen, dim, hidden_dim=None):
+        super().__init__()
+        self.dim = dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else dim
+        self.to_q = nn.Linear(dim, self.hidden_dim)
+        self.to_k = nn.Linear(dim, self.hidden_dim)
+        self.to_v = nn.Linear(dim, self.hidden_dim)
+        self.project = nn.Linear(self.hidden_dim, dim)
 
-def exists(val):
-    return val is not None
+    def forward(self, x):
+        B, T, _ = x.shape
+        Q = self.to_q(x).view(B, T, self.hidden_dim)
+        K = self.to_k(x).view(B, T, self.hidden_dim)
+        V = self.to_v(x).view(B, T, self.hidden_dim)
 
+        # AFT 방식의 가중치 계산
+        weights = torch.mul(torch.softmax(K, 1), V).sum(dim=1, keepdim=True)
+        Q_sig = torch.sigmoid(Q)
+        Yt = torch.mul(Q_sig, weights)
 
-def default(val, d):
-    return val if exists(val) else d
+        Yt = Yt.view(B, T, self.hidden_dim)
+        Yt = self.project(Yt)
 
+        return Yt
 
-def cache_fn(f):
-    cache = None
-
-    @wraps(f)
-    def cached_fn(*args, _cache=True, **kwargs):
-        if not _cache:
-            return f(*args, **kwargs)
-        nonlocal cache
-        if cache is not None:
-            return cache
-        cache = f(*args, **kwargs)
-        return cache
-
-    return cached_fn
-
-def fourier_encode(x, max_freq, num_bands = 4):
-    x = x.unsqueeze(-1)
-    device, dtype, orig_x = x.device, x.dtype, x
-
-    scales = torch.linspace(1., max_freq / 2, num_bands, device = device, dtype = dtype)
-    scales = scales[(*((None,) * (len(x.shape) - 1)), Ellipsis)]
-
-    x = x * scales * pi
-    x = torch.cat([x.sin(), x.cos()], dim = -1)
-    x = torch.cat((x, orig_x), dim = -1)
-    return x
-
-# helper classes
-
+# PreNorm 클래스 정의
 class PreNorm(nn.Module):
     def __init__(self, dim, fn, context_dim=None):
         super().__init__()
         self.fn = fn
         self.norm = nn.LayerNorm(dim)
-        self.norm_context = nn.LayerNorm(context_dim) if exists(context_dim) else None
+        self.norm_context = nn.LayerNorm(context_dim) if context_dim is not None else None
 
     def forward(self, x, **kwargs):
         x = self.norm(x)
-
-        if exists(self.norm_context):
-            context = kwargs['context']
+        if self.norm_context is not None:
+            context = kwargs.get('context')
             normed_context = self.norm_context(context)
             kwargs.update(context=normed_context)
-
         return self.fn(x, **kwargs)
 
-
-class GEGLU(nn.Module):
-    def forward(self, x):
-        x, gates = x.chunk(2, dim=-1)
-        return x * F.gelu(gates)
-
-
+# FeedForward 클래스 정의
 class FeedForward(nn.Module):
     def __init__(self, dim, mult=4):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(dim, dim * mult * 2),
-            GEGLU(),
+            nn.Linear(dim, dim * mult),
+            nn.GELU(),
             nn.Linear(dim * mult, dim)
         )
 
     def forward(self, x):
         return self.net(x)
 
-
+# Attention 클래스 정의
 class Attention(nn.Module):
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
         inner_dim = dim_head * heads
-        context_dim = default(context_dim, query_dim)
+        context_dim = context_dim if context_dim is not None else query_dim
         self.scale = dim_head ** -0.5
         self.heads = heads
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias=False)
         self.to_out = nn.Linear(inner_dim, query_dim)
-
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, context=None, mask=None):
         h = self.heads
-
         q = self.to_q(x)
-        context = default(context, x)
+        context = context if context is not None else x
         k, v = self.to_kv(context).chunk(2, dim=-1)
-
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
-
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
-        if exists(mask):
+        if mask is not None:
             mask = rearrange(mask, 'b ... -> b (...)')
             max_neg_value = -torch.finfo(sim.dtype).max
             mask = repeat(mask, 'b j -> (b h) () j', h=h)
             sim.masked_fill_(~mask, max_neg_value)
 
-        # attention, what we cannot get enough of
         attn = sim.softmax(dim=-1)
-
-        # dropout
         attn = self.dropout(attn)
-
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
-
 
 # PerceiverIO adapted for 6-DoF manipulation
 class PerceiverVoxelLangEncoder(nn.Module):
@@ -247,7 +216,7 @@ class PerceiverVoxelLangEncoder(nn.Module):
         # latent vectors (that are randomly initialized)
         self.latents = nn.Parameter(torch.randn(num_latents, latent_dim))
 
-        # encoder cross attention
+        # cross attention blocks (remains unchanged)
         self.cross_attend_blocks = nn.ModuleList([
             PreNorm(latent_dim, Attention(latent_dim,
                                           self.input_dim_before_seq,
@@ -258,23 +227,18 @@ class PerceiverVoxelLangEncoder(nn.Module):
             PreNorm(latent_dim, FeedForward(latent_dim))
         ])
 
-        get_latent_attn = lambda: PreNorm(latent_dim,
-                                          Attention(latent_dim, heads=latent_heads,
-                                                    dim_head=latent_dim_head, dropout=attn_dropout))
-        get_latent_ff = lambda: PreNorm(latent_dim, FeedForward(latent_dim))
-        get_latent_attn, get_latent_ff = map(cache_fn, (get_latent_attn, get_latent_ff))
+        # 기존 self-attention을 AFT로 교체
+        self.self_attention = AFTSimple(max_seqlen=1000, dim=latent_dim)  # max_seqlen은 임의로 설정 가능
 
         # self attention layers
         self.layers = nn.ModuleList([])
-        cache_args = {'_cache': weight_tie_layers}
-
         for i in range(depth):
             self.layers.append(nn.ModuleList([
-                get_latent_attn(**cache_args),
-                get_latent_ff(**cache_args)
+                self.self_attention,
+                PreNorm(latent_dim, FeedForward(latent_dim))
             ]))
 
-        # decoder cross attention
+        # decoder cross attention (remains unchanged)
         self.decoder_cross_attn = PreNorm(self.input_dim_before_seq, Attention(self.input_dim_before_seq,
                                                                                latent_dim,
                                                                                heads=cross_heads,
@@ -384,19 +348,6 @@ class PerceiverVoxelLangEncoder(nn.Module):
         if not self.pos_encoding_with_lang:
             ins = ins + self.pos_encoding
 
-        ######################## NOTE #############################
-        # NOTE: If you add positional encodings ^here the lang embs
-        # won't have positional encodings. I accidently forgot
-        # to turn this off for all the experiments in the paper.
-        # So I guess those models were using language embs
-        # as a bag of words :( But it doesn't matter much for
-        # RLBench tasks since we don't test for novel instructions
-        # at test time anyway. The recommend way is to add
-        # positional encodings to the final input sequence
-        # fed into the Perceiver Transformer, as done below
-        # (and also in the Colab tutorial).
-        ###########################################################
-
         # concat to channels of and flatten axis
         queries_orig_shape = ins.shape
 
@@ -423,7 +374,7 @@ class PerceiverVoxelLangEncoder(nn.Module):
             x = cross_attn(x, context=ins, mask=mask) + x
             x = cross_ff(x) + x
 
-            # self-attention layers
+            # self-attention layers (AFT 적용)
             for self_attn, self_ff in self.layers:
                 x = self_attn(x) + x
                 x = self_ff(x) + x
